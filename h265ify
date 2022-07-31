@@ -1,0 +1,190 @@
+#!/usr/bin/env python3
+
+import json
+import os
+import re
+import subprocess
+import time
+from datetime import timedelta
+from functools import lru_cache
+from io import TextIOWrapper
+from os import path, walk
+from sys import argv, stderr
+from typing import List, TypedDict, Union
+
+
+def remove_hidden_files(files: List[str]) -> List[str]:
+    return [file for file in files if not file.startswith(".")]
+
+
+def eprint(*args, **kwargs):
+    print(*args, file=stderr, **kwargs)
+
+
+ProbeInfo = TypedDict("ProbeInfo", {"video_stream": dict, "format": dict})
+
+
+@lru_cache(maxsize=4)
+def probe_video(file: str) -> ProbeInfo:
+    probe = json.loads(subprocess.check_output(
+        ["ffprobe",
+         "-loglevel", "error",
+         "-print_format", "json",
+         "-show_format",
+         "-show_streams",
+         "-select_streams", "v:0",
+         file]))
+
+    video_stream = probe.get("streams", [])[0]
+    format = probe.get("format")
+    if not video_stream or not format:
+        return None
+
+    return {"video_stream": video_stream, "format": format}
+
+
+def get_target_bitrate(file: str) -> Union[int, None]:
+    probe = probe_video(file)
+    if not probe:
+        return None
+
+    video_stream = probe.get("video_stream")
+    format = probe.get("format")
+    if video_stream.get("codec_name") != "h264":
+        return None
+
+    bitrate = video_stream.get("bit_rate") or format.get("bit_rate")
+    if not bitrate:
+        return None
+
+    try:
+        bitrate = int(bitrate)
+    except ValueError:
+        return None
+
+    return round(bitrate / 1.8)
+
+
+def get_video_duration_ms(file: str) -> Union[int, None]:
+    probe = probe_video(file)
+    if not probe:
+        return None
+
+    format = probe.get("format", {})
+    duration = format.get("duration")
+    if not duration:
+        return None
+
+    try:
+        duration = float(duration)
+    except ValueError:
+        return None
+
+    return int(duration * 1000)
+
+
+def get_video_format(file: str) -> Union[str, None]:
+    probe = probe_video(file)
+    if not probe:
+        return None
+
+    format = probe.get("format")
+    format = format.get("format_name", "").split(",")[0]
+    if not format:
+        return None
+
+    return format
+
+
+def transcode(file: str, bitrate: int) -> None:
+    eprint(
+        f"Convert {file} to H.265 with target bitrate: {bitrate / 1000:.1f}k")
+
+    tmp_file = f"{file}.tmp"
+
+    duration_ms = get_video_duration_ms(file)
+
+    started_at = time.monotonic_ns()
+
+    format = get_video_format(file)
+
+    process = subprocess.Popen(["ffmpeg",
+                                "-loglevel", "error",
+                                "-hide_banner",
+                                "-nostdin", "-y",
+                                "-progress", "-",
+                                "-i", file,
+                                "-map", "0",
+                                "-map_metadata", "0",
+                                "-c", "copy",
+                                "-c:v", "hevc_videotoolbox",
+                                "-b:v", str(bitrate),
+                                "-tag:v", "hvc1",
+                                "-pix_fmt", "nv12",
+                                "-f", format,
+                                tmp_file],
+                               stdout=subprocess.PIPE)
+    try:
+        for line in TextIOWrapper(process.stdout, encoding="utf-8"):
+            out_time_us_re = r"^out_time_us=(\d+)$"
+            out_time_microseconds = re.search(out_time_us_re, line)
+            if not out_time_microseconds:
+                continue
+
+            out_time_microseconds = float(out_time_microseconds.group(1))
+            out_time = timedelta(microseconds=out_time_microseconds)
+            out_time_ms = round(out_time_microseconds / 1000)
+
+            duration = timedelta(milliseconds=duration_ms)
+
+            if not duration_ms:
+                eprint("\rDuration: {}".format(out_time), end="")
+                continue
+
+            time_elapsed = timedelta(
+                microseconds=(time.monotonic_ns() - started_at) / 1000)
+            eta = (duration - out_time) / (out_time / time_elapsed)
+            eprint(
+                f"Progress: {out_time_ms / duration_ms * 100:.1f}% (ETA: {eta})", end="\r")
+    except KeyboardInterrupt:
+        process.kill()
+        process.wait()
+        exit(1)
+
+    eprint("")
+
+    exit_code = process.wait()
+    if exit_code != 0:
+        eprint(f"FFmpeg exited with code {exit_code}")
+        return
+
+    os.replace(tmp_file, file)
+
+
+def main():
+    usage = """Usage: {executable} <path>""".format(executable=argv[0])
+
+    video_extensions = {".flv", ".mkv", ".mp4"}
+
+    if len(argv) != 2:
+        print(usage)
+        exit(1)
+
+    root_path = argv[1]
+
+    for root, dirs, files in walk(root_path):
+        for file in files:
+            (_, ext) = path.splitext(file)
+            if not ext in video_extensions:
+                continue
+
+            fullpath = path.join(root, file)
+            target_bitrate = get_target_bitrate(fullpath)
+            if not target_bitrate:
+                continue
+
+            transcode(file=fullpath, bitrate=target_bitrate)
+
+
+if __name__ == "__main__":
+    main()
