@@ -83,6 +83,15 @@ def get_video_duration_ms(file: str) -> Union[int, None]:
     return int(duration * 1000)
 
 
+def get_video_pix_fmt(file: str) -> Union[str, None]:
+    probe = probe_video(file)
+    if not probe:
+        return None
+
+    video_stream = probe.get("video_stream")
+    return video_stream.get("pix_fmt")
+
+
 def get_video_format(file: str) -> Union[str, None]:
     probe = probe_video(file)
     if not probe:
@@ -96,9 +105,17 @@ def get_video_format(file: str) -> Union[str, None]:
     return format
 
 
-def transcode(file: str, bitrate: int) -> None:
+def transcode(file: str, bitrate: int, pix_fmt: str) -> None:
     eprint(
         f"Convert {file} to H.265 with target bitrate: {bitrate / 1000:.1f}k")
+
+    pix_fmt_map = {
+        "yuv420p": "nv12",
+    }
+
+    target_pix_fmt = pix_fmt_map.get(pix_fmt, pix_fmt)
+
+    eprint("Pixel format: {} → {}".format(pix_fmt, target_pix_fmt))
 
     tmp_file = f"{file}.tmp"
 
@@ -120,7 +137,7 @@ def transcode(file: str, bitrate: int) -> None:
                                 "-c:v", "hevc_videotoolbox",
                                 "-b:v", str(bitrate),
                                 "-tag:v", "hvc1",
-                                "-pix_fmt", "nv12",
+                                "-pix_fmt", target_pix_fmt,
                                 "-f", format,
                                 tmp_file],
                                stdout=subprocess.PIPE)
@@ -145,8 +162,9 @@ def transcode(file: str, bitrate: int) -> None:
                 microseconds=(time.monotonic_ns() - started_at) / 1000)
             eta = (duration - out_time) / (out_time / time_elapsed)
             eprint(
-                f"Progress: {out_time_ms / duration_ms * 100:.1f}% (ETA: {eta})", end="\r")
+                f"Progress: {out_time_ms / duration_ms * 100:.1f}% (ETA: {str(eta).split('.')[0]})", end="\r")
     except KeyboardInterrupt:
+        eprint("\nExiting...")
         process.kill()
         process.wait()
         exit(1)
@@ -159,6 +177,9 @@ def transcode(file: str, bitrate: int) -> None:
         return
 
     os.replace(tmp_file, file)
+
+    eprint("Completed")
+    eprint("")
 
 
 def main():
@@ -183,7 +204,12 @@ def main():
             if not target_bitrate:
                 continue
 
-            transcode(file=fullpath, bitrate=target_bitrate)
+            pix_fmt = get_video_pix_fmt(fullpath)
+            if not pix_fmt:
+                continue
+
+            transcode(file=fullpath, bitrate=target_bitrate,
+                      pix_fmt=pix_fmt)
 
 
 if __name__ == "__main__":
